@@ -1044,6 +1044,49 @@ def _int8_linear_dequant(
     return out.reshape(x.shape[:-1] + (n,))
 
 
+def _mps_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Use Metal 4 fused kernels when supported, otherwise widen to floating point."""
+    if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+        from .mps_int8 import FusedMPSUnsupportedError, int8_linear_bf16
+
+        if convrot:
+            if x.shape[-1] % convrot_groupsize != 0:
+                raise ValueError(
+                    f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+                )
+            h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+            x = _rotate_activation(x, h, convrot_groupsize)
+        try:
+            return int8_linear_bf16(x, weight, weight_scale, bias)
+        except FusedMPSUnsupportedError:
+            return _int8_linear_dequant(
+                x,
+                weight,
+                weight_scale,
+                bias,
+                out_dtype,
+                False,
+                convrot_groupsize,
+            )
+    return _int8_linear_dequant(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    )
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1083,6 +1126,19 @@ def int8_linear(
         raise ValueError(
             f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
             f"for weight shape {tuple(weight.shape)}"
+        )
+
+    # Prefer Metal 4's cooperative INT8 tensor operations on Apple silicon. The
+    # helper retains the floating-point widening path for older MPS runtimes.
+    if x.device.type == "mps":
+        return _mps_int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
         )
 
     if not _device_has_int8_mm(x.device.type):
