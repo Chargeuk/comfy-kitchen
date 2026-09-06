@@ -1,4 +1,4 @@
-# Apple MPS INT8 branch
+# Apple MPS branch
 
 This branch combines two upstream works while keeping their responsibilities
 separate:
@@ -20,12 +20,12 @@ fused kernel. If the fused path is unavailable, it calls the fallback with
 `convrot=False`, preventing a second rotation.
 
 The branch is based on comfy-kitchen v0.2.33 (`e9ea99c`) and identifies itself
-as `0.2.33+chargeuk.mps2`. Install the tested commit after ComfyUI's requirements
+as `0.2.33+chargeuk.mps3`. Install the tested commit after ComfyUI's requirements
 so ComfyUI's PyPI pin does not replace it.
 
 ## M4 backend
 
-The `mps` registry backend provides INT8 linear and FP8 dequantization. INT8
+The `mps` registry backend provides INT8 linear, FP8 and NVFP4 dequantization. INT8
 weights remain compressed; FP16 activations widen to FP32 before rotation and
 GEMM so an unscaled intermediate cannot overflow before the output scale.
 This correctness fix can cost performance versus the original FP16 fallback.
@@ -44,6 +44,21 @@ performed in byte form on the GPU, avoiding full-size int64 gather indices and
 CPU weight copies. Unsupported shader contracts use a byte-lookup fallback;
 input gradients are explicitly unsupported. CUDA/CPU behavior is unchanged.
 
+NVFP4 decoding reads packed E2M1 weights and directly addresses cuBLAS-swizzled
+E4M3 block scales in Metal. Both nibble orders, byte-safe strided inputs and
+FP16/BF16/FP32 outputs are supported. It preserves the eager implementation's
+separate rounding of the tensor scale, block scale, scale product and output.
+Unsupported shaders retain CPU compatibility decoding; out-of-memory errors
+propagate instead of triggering that more memory-hungry fallback. Scale gradients
+are explicitly unsupported. This is NVFP4 storage with floating-point compute,
+not Blackwell-style native FP4 matrix multiplication.
+
+AppleSilicon-FP8 patches the eager backend, so the higher-priority MPS registry
+path can bypass its CPU NVFP4 decoder without another custom-node or ComfyUI
+patch. ComfyUI still owns model loading and when weights are expanded. No
+full-model decoded-weight cache, new activation quantization, or fused NVFP4
+matrix multiplication is introduced. MXFP8 retains its existing fallback.
+
 `integrations/applesilicon-fp8-kitchen.patch` is the small companion patch for
 AppleSilicon-FP8 v1.3.2 (`74734a1`): its shared decoder uses Kitchen when present
 and retains its original fallback otherwise. Apply with `git apply --check`
@@ -58,7 +73,7 @@ Enable Python DEBUG logging for `comfy_kitchen.dispatch` for registry choices.
 
 ## Validation and benchmarking
 
-Run `python -m pytest tests/test_mps_fp8.py tests/test_mps_rotation.py
+Run `python -m pytest tests/test_mps_fp8.py tests/test_mps_nvfp4.py tests/test_mps_rotation.py
 tests/test_mps_dispatch.py tests/test_int8_fallback.py tests/test_int8_mps.py`
 outside a sandbox that blocks Metal device access.
 
@@ -67,6 +82,19 @@ other GPU work is idle. It alternates AB/BA order, saves every timing, records
 macOS thermal pressure, rejects serious/critical-pressure pairs and flags drift.
 Nominal pressure is not proof of identical clocks or zero throttling. Report
 operation timings separately from end-to-end model generation.
+
+`benchmarks/benchmark_nvfp4_model.py` tests a user-supplied local MiniMax H3 Qwen3-VL
+NVFP4 text encoder without downloading anything. `--mode layer` reads only a
+selected layer, checks decoding and AWQ-scaled linear outputs against a CPU
+decode reference, and alternates CPU/native timings. `--mode encode` exercises
+the native ComfyUI loader and text encoder, checks that weights remain packed,
+and saves raw outputs, thermal pressure and dispatch counts. Use installed
+Kitchen for the baseline and `--kitchen-source PATH` for the candidate. Memory
+snapshots are not peak-memory measurements. Compare output directories with
+`--compare BASELINE_DIR CANDIDATE_DIR`.
+
+Measured results and limits are recorded in [M4_VALIDATION.md](M4_VALIDATION.md)
+for FP8/INT8 and [M4_NVFP4_VALIDATION.md](M4_NVFP4_VALIDATION.md) for NVFP4.
 
 The M4 implementation is original code informed by the regular-basis math and
 the approaches in [AppMana's MPS branch](https://github.com/AppMana/forks-comfy-kitchen-m1-m4/tree/mps-backend),
