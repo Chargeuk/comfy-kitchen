@@ -1,0 +1,29 @@
+diff --git a/_patches/_common.py b/_patches/_common.py
+index 9d91c6b..a06ba24 100644
+--- a/_patches/_common.py
++++ b/_patches/_common.py
+@@ -14,6 +14,11 @@ with a real FP8->float cast and runs entirely on the GPU.
+ 
+ import torch
+ 
++try:
++    from comfy_kitchen.backends.mps import fp8 as _kitchen_mps_fp8
++except ImportError:
++    _kitchen_mps_fp8 = None
++
+ FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+ 
+ _lut_cache = {}
+@@ -41,6 +46,11 @@ def decode_fp8(t, out_dtype=torch.float32):
+     case needs CPU, because MPS cannot run .contiguous() on an FP8 dtype.
+     """
+     device = t.device
++    if device.type == "mps" and _kitchen_mps_fp8 is not None:
++        try:
++            return _kitchen_mps_fp8.decode_fp8(t, out_dtype)
++        except _kitchen_mps_fp8.MPSFP8UnsupportedError:
++            pass
+     lut = fp8_to_float_lut(t.dtype, device, out_dtype)
+     if t.is_contiguous():
+         idx = t.view(torch.uint8).to(torch.long)
+

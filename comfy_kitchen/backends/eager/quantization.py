@@ -1012,9 +1012,11 @@ def _int8_linear_dequant(
     time, bounded so neither the cast weight slice nor the float32 output slice
     exceeds ~256 MB; and the weight scale is applied to the output in float32. The
     weight stays INT8 in memory — no full-weight float copy and no weight rotation.
-    Activations are not quantized on this path, so the result is slightly more
-    accurate than the INT8 path, not less.
+    Activations are not quantized on this path. FP16 inputs use float32 GEMM:
+    scaling after an FP16 GEMM can overflow before a small scale is applied.
     """
+    if x.dtype == torch.float16:
+        x = x.float()
     if convrot:
         if x.shape[-1] % convrot_groupsize != 0:
             raise ValueError(
@@ -1033,7 +1035,7 @@ def _int8_linear_dequant(
         1,
         min(
             n,
-            _FALLBACK_CHUNK_BYTES // max(1, k * x.element_size()),
+            _FALLBACK_CHUNK_BYTES // max(1, k * x2.element_size()),
             _FALLBACK_CHUNK_BYTES // max(1, x2.shape[0] * 4),
         ),
     )
@@ -1057,6 +1059,15 @@ def _mps_int8_linear(
     convrot_groupsize: int,
 ) -> torch.Tensor:
     """Use Metal 4 fused kernels when supported, otherwise widen to floating point."""
+    if x.dtype == torch.float16:
+        x = x.float()
+    if convrot:
+        from ..mps.rotation import try_regular_rotation
+
+        rotated = try_regular_rotation(x, convrot_groupsize)
+        if rotated is not None:
+            x = rotated
+            convrot = False
     if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
         from .mps_int8 import FusedMPSUnsupportedError, int8_linear_bf16
 

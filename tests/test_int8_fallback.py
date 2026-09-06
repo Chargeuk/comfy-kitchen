@@ -66,6 +66,29 @@ def test_device_has_int8_mm_trusts_cuda_and_cpu():
     assert quantization._device_has_int8_mm("cuda")
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("mps", marks=pytest.mark.skipif(not MPS_AVAILABLE, reason="MPS device required"))])
+@pytest.mark.parametrize("per_channel", [False, True])
+def test_fp16_fallback_scales_before_output_overflow(device, per_channel):
+    x = torch.ones((2, 1024), dtype=torch.float16, device=device)
+    weight = torch.full((4, 1024), 127, dtype=torch.int8, device=device)
+    scale = torch.tensor([0.001, 0.002, 0.003, 0.004] if per_channel else 0.001, device=device)
+    bias = torch.arange(4, device=device, dtype=torch.float16)
+    result = quantization._int8_linear_dequant(x, weight, scale, bias, torch.float16, False, 256)
+    reference = (torch.nn.functional.linear(x.float(), weight.float()) * scale + bias.float()).half()
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("mps", marks=pytest.mark.skipif(not MPS_AVAILABLE, reason="MPS device required"))])
+def test_fp16_convrot_does_not_overflow_before_gemm(device):
+    h = quantization._build_hadamard(256)
+    x = (h[0].sign() * 30000).half().reshape(1, 256).to(device)
+    weight = torch.ones((4, 256), dtype=torch.int8, device=device)
+    scale = torch.tensor(0.001, device=device)
+    result = quantization._int8_linear_dequant(x, weight, scale, None, torch.float16, True, 256)
+    torch.testing.assert_close(result.cpu(), torch.full((1, 4), 480, dtype=torch.float16), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("convrot", [False, True])
 def test_dispatch_path_falls_back_without_int_mm(monkeypatch, convrot):
     """``F.linear(x, qt)`` / ``mm`` / ``addmm`` must not touch ``_int_mm``."""
