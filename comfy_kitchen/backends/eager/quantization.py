@@ -1026,7 +1026,6 @@ def _int8_linear_dequant(
         x = _rotate_activation(x, h, convrot_groupsize)
     n, k = weight.shape
     x2 = x.reshape(-1, k)
-    out = torch.empty(x2.shape[0], n, device=x.device, dtype=out_dtype)
     if bias is not None:
         bias = bias.to(device=x.device, dtype=torch.float32)
     # One output-channel slice at a time: bounds both the cast weight slice
@@ -1039,12 +1038,30 @@ def _int8_linear_dequant(
             _FALLBACK_CHUNK_BYTES // max(1, x2.shape[0] * 4),
         ),
     )
+    # A single slice already owns the entire output; don't allocate and copy
+    # another full result just to return it. Keep the bounded multi-slice path.
+    out = torch.empty(x2.shape[0], n, device=x.device, dtype=out_dtype) if chunk != n else None
     for i in range(0, n, chunk):
         w = weight[i:i + chunk].to(dtype=x.dtype)
         y = torch.nn.functional.linear(x2, w).float()
-        y *= weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
+        scale_slice = weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
+        bias_slice = None if bias is None else bias[i:i + chunk]
+        if x.device.type == "mps":
+            from ..mps.int8 import MPSINT8EpilogueUnsupportedError, int8_epilogue
+
+            try:
+                result = int8_epilogue(y, scale_slice, bias_slice, out_dtype, out=out, column_offset=i)
+            except MPSINT8EpilogueUnsupportedError:
+                pass
+            else:
+                if chunk == n:
+                    return result.reshape(*x.shape[:-1], n)
+                continue
+        y *= scale_slice
         if bias is not None:
-            y += bias[i:i + chunk]
+            y += bias_slice
+        if chunk == n:
+            return y.to(out_dtype).reshape(*x.shape[:-1], n)
         out[:, i:i + chunk] = y.to(out_dtype)
     return out.reshape(*x.shape[:-1], n)
 
@@ -1059,6 +1076,13 @@ def _mps_int8_linear(
     convrot_groupsize: int,
 ) -> torch.Tensor:
     """Use Metal 4 fused kernels when supported, otherwise widen to floating point."""
+    if convrot:
+        from ..mps.convrot import try_rotate
+
+        rotated = try_rotate(x, convrot_groupsize, output_dtype=torch.float32 if x.dtype == torch.float16 else x.dtype)
+        if rotated is not None:
+            x = rotated
+            convrot = False
     if x.dtype == torch.float16:
         x = x.float()
     if convrot:

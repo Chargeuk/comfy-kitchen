@@ -3,16 +3,16 @@ index 9d91c6b..a06ba24 100644
 --- a/_patches/_common.py
 +++ b/_patches/_common.py
 @@ -14,6 +14,11 @@ with a real FP8->float cast and runs entirely on the GPU.
- 
+
  import torch
- 
+
 +try:
 +    from comfy_kitchen.backends.mps import fp8 as _kitchen_mps_fp8
 +except ImportError:
 +    _kitchen_mps_fp8 = None
 +
  FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
- 
+
  _lut_cache = {}
 @@ -41,6 +46,11 @@ def decode_fp8(t, out_dtype=torch.float32):
      case needs CPU, because MPS cannot run .contiguous() on an FP8 dtype.
@@ -26,4 +26,55 @@ index 9d91c6b..a06ba24 100644
      lut = fp8_to_float_lut(t.dtype, device, out_dtype)
      if t.is_contiguous():
          idx = t.view(torch.uint8).to(torch.long)
+diff --git a/_patches/int4_linear_mps.py b/_patches/int4_linear_mps.py
+index 6dda857..9b44f17 100644
+--- a/_patches/int4_linear_mps.py
++++ b/_patches/int4_linear_mps.py
+@@ -33,6 +33,16 @@ import sys
 
+ import torch
+
++try:
++    from comfy_kitchen.backends.mps import int4 as _kitchen_mps_int4
++except ImportError:
++    _kitchen_mps_int4 = None
++
++try:
++    from comfy_kitchen.backends.mps import convrot as _kitchen_mps_convrot
++except ImportError:
++    _kitchen_mps_convrot = None
++
+ TAG = "[AppleSilicon-FP8/int4_linear]"
+
+ _installed = False
+@@ -137,8 +147,10 @@ def _verify():
+ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
+     orig_shape = x.shape
+     x2d = x.reshape(-1, orig_shape[-1])
+-    h = mod._build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
+-    x_rot = mod._rotate_activation(x2d, h, convrot_groupsize)
++    x_rot = None if _kitchen_mps_convrot is None else _kitchen_mps_convrot.try_rotate(x2d, convrot_groupsize)
++    if x_rot is None:
++        h = mod._build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
++        x_rot = mod._rotate_activation(x2d, h, convrot_groupsize)
+
+     from . import _caps
+     # No chip pre-filter here, unlike int8/fp8. int4 is opt-in: int4_ext's loader
+@@ -162,8 +174,15 @@ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
+                   f"rest of this session.")
+             _caps.mark_kernel_failed("int4")
+
+-    w = _unpack_int4_signed_fast(qweight, x2d.dtype)
+-    w = w * wscales.to(device=w.device, dtype=x2d.dtype).reshape(-1, 1)
++    w = None
++    if _kitchen_mps_int4 is not None:
++        try:
++            w = _kitchen_mps_int4.unpack_int4_scaled(qweight, wscales, x2d.dtype)
++        except _kitchen_mps_int4.MPSINT4UnsupportedError:
++            pass
++    if w is None:
++        w = _unpack_int4_signed_fast(qweight, x2d.dtype)
++        w = w * wscales.to(device=w.device, dtype=x2d.dtype).reshape(-1, 1)
+     b = bias.to(device=x2d.device, dtype=x2d.dtype) if bias is not None else None
+     y = torch.nn.functional.linear(x_rot, w, b)
+     return y.reshape(*orig_shape[:-1], qweight.shape[0])

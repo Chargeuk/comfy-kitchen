@@ -86,6 +86,7 @@ def main():
     ap.add_argument('--steps', type=int, default=8)
     ap.add_argument('--skip-apple-patches', action='store_true')
     ap.add_argument('--inspect-only', action='store_true', help='Load and record parameter storage, without inference')
+    ap.add_argument('--profile-convrot', action='store_true', help='Intrusive per-operation MPS timings for INT8/INT4 paths')
     ap.add_argument('--compare', nargs=2)
     args = ap.parse_args()
     if args.compare:
@@ -124,6 +125,23 @@ def main():
     from comfy_kitchen.backends.eager import quantization as qmod
     counts = collections.Counter()
     shapes = collections.Counter()
+    profile = collections.defaultdict(lambda: {'count': 0, 'seconds': 0.0, 'shapes': {}})
+    def profile_call(label, fn, *a, **kw):
+        if not args.profile_convrot:
+            return fn(*a, **kw)
+        sync()
+        started = time.perf_counter()
+        result = fn(*a, **kw)
+        sync()
+        elapsed = time.perf_counter() - started
+        item = profile[label]
+        item['count'] += 1
+        item['seconds'] += elapsed
+        desc = '|'.join(f'{tuple(v.shape)}:{v.dtype}' for v in a[:2] if isinstance(v, torch.Tensor))
+        shape = item['shapes'].setdefault(desc, {'count': 0, 'seconds': 0.0})
+        shape['count'] += 1
+        shape['seconds'] += elapsed
+        return result
     # Registry resolves backend attributes at call time. Wrap both exported and
     # implementation-module entries, preserving original object identity.
     for name in ('int8_linear', '_int8_linear_dequant', '_mps_int8_linear',
@@ -140,26 +158,53 @@ def main():
                     counts[_name] += 1
                     if a and isinstance(a[0], torch.Tensor):
                         shapes[f'{_name}:{tuple(a[0].shape)}:{a[0].dtype}'] += 1
+                    if len(a) > 1 and isinstance(a[1], torch.Tensor):
+                        shapes[f'{_name}:weight={tuple(a[1].shape)}:{a[1].dtype}'] += 1
+                    if _name == '_int8_linear_dequant':
+                        return profile_call(_name + ':inclusive', _orig, *a, **kw)
                     return _orig(*a, **kw)
                 wrappers[id(original)] = wrapper
             setattr(module, name, wrappers[id(original)])
-    for module_name in ('comfy_kitchen.backends.mps.fp8', 'comfy_kitchen.backends.mps.rotation'):
+    if args.profile_convrot:
+        # Only plain operands: an outer QuantizedTensor call dispatches to a
+        # separately profiled floating-point linear operation.
+        _linear = torch.nn.functional.linear
+        def profiled_linear(*a, **kw):
+            if len(a) > 1 and all(isinstance(a[i], torch.Tensor) and not hasattr(a[i], '_layout_cls') for i in (0, 1)):
+                return profile_call('torch.nn.functional.linear', _linear, *a, **kw)
+            return _linear(*a, **kw)
+        torch.nn.functional.linear = profiled_linear
+    mps_modules = tuple('comfy_kitchen.backends.mps.' + name for name in ('fp8', 'rotation', 'int4', 'convrot', 'int8'))
+    for module_name in mps_modules:
         try:
             importlib.import_module(module_name)
         except ImportError:
             pass
+    if args.profile_convrot:
+        for module in (qmod, sys.modules.get('comfy_kitchen.backends.eager.convrot_w4a4')):
+            if module is not None and hasattr(module, '_rotate_activation'):
+                original = module._rotate_activation
+                module._rotate_activation = lambda *a, _o=original, **kw: profile_call('_rotate_activation', _o, *a, **kw)
+        for name, module in list(sys.modules.items()):
+            if name.startswith('validation_apple_fp8._patches') and hasattr(module, '_unpack_int4_signed_fast'):
+                original = module._unpack_int4_signed_fast
+                module._unpack_int4_signed_fast = lambda *a, _o=original, **kw: profile_call('_unpack_int4_signed_fast', _o, *a, **kw)
     for module_name, module in list(sys.modules.items()):
         if not (module_name.startswith('validation_apple_fp8._patches') or
-                module_name in ('comfy_kitchen.backends.mps.fp8', 'comfy_kitchen.backends.mps.rotation')):
+                module_name in mps_modules):
             continue
-        for name in ('decode_fp8', '_w4a16_linear_mps', 'try_regular_rotation'):
+        for name in ('decode_fp8', '_w4a16_linear_mps', 'try_regular_rotation',
+                     'unpack_int4_scaled', 'try_rotate', 'int8_epilogue'):
             original = getattr(module, name, None)
             if original is None:
                 continue
             label = f'{module_name}.{name}'
             def tracked(*a, _orig=original, _label=label, **kw):
                 counts[_label] += 1
-                result = _orig(*a, **kw)
+                if a and isinstance(a[0], torch.Tensor):
+                    desc = '|'.join(f'{tuple(v.shape)}:{v.dtype}' for v in a[:2] if isinstance(v, torch.Tensor))
+                    shapes[f'{_label}:{desc}'] += 1
+                result = profile_call(_label + ':inclusive', _orig, *a, **kw) if '_w4a16_linear_mps' in _label else _orig(*a, **kw)
                 if result is not None:
                     counts[_label + ':success'] += 1
                 return result
@@ -168,6 +213,8 @@ def main():
     report = {'model': str(model_path), 'kitchen': ck.__file__, 'torch': torch.__version__,
               'apple_patches': not args.skip_apple_patches, 'seed': 20260906,
               'runs': [], 'notes': 'First run cold; subsequent runs warm. Same checkpoint across backends isolates kernel changes.'}
+    if args.profile_convrot:
+        report['profile_note'] = 'Intrusive profiling: each operation synchronizes MPS before and after timing; timings are not comparable to normal runs.'
     report['thermal_start'] = subprocess.run(['/usr/bin/pmset', '-g', 'therm'], capture_output=True, text=True).stdout
     thermal = Thermal()
     report['thermal_pressure_start'] = thermal.snapshot()
@@ -225,6 +272,7 @@ def main():
             raise RuntimeError('Serious thermal pressure; stopping rather than collecting distorted timings')
         counts.clear()
         shapes.clear()
+        profile.clear()
         sync()
         start = time.perf_counter()
         with torch.inference_mode():
@@ -232,7 +280,9 @@ def main():
         sync()
         elapsed = time.perf_counter() - start
         tensors = {k: v.detach().float().cpu() for k, v in output.items() if isinstance(v, torch.Tensor)}
+        profile_json = {k: {'count': v['count'], 'seconds': v['seconds'], 'shapes': dict(v['shapes'])} for k, v in profile.items()}
         report['runs'].append({'seconds': elapsed, 'counts': dict(counts), 'shapes': dict(shapes),
+                               **({'profile': profile_json} if args.profile_convrot else {}),
                                'thermal_before': pressure_before, 'thermal_after': thermal.snapshot(),
                                'all_finite': all(bool(torch.isfinite(v).all()) for v in tensors.values()),
                                'mps_allocated_bytes': torch.mps.current_allocated_memory(),
