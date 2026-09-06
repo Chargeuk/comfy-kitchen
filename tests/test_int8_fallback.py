@@ -166,15 +166,15 @@ def test_fallback_chunks_match_single_pass(monkeypatch, convrot):
 
 
 def test_native_path_untouched_when_int_mm_exists(monkeypatch):
-    """CPU has ``_int_mm``: the fallback must not engage there."""
+    """CPU has an INT8 GEMM: the fallback must not engage there."""
     calls = []
-    real = torch._int_mm
+    real = quantization._fast_int8_mm
 
     def counting_int_mm(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "_int_mm", counting_int_mm)
+    monkeypatch.setattr(quantization, "_fast_int8_mm", counting_int_mm)
     qt = _quantized_weight(convrot=False, seed=2)
     torch.nn.functional.linear(torch.randn(8, K, dtype=torch.bfloat16), qt)
     assert calls, "expected the native INT8 GEMM on CPU"

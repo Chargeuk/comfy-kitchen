@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Apple MPS regression tests for fused and fallback INT8 linear paths."""
 
-import platform
-
 import pytest
 import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends._activations import apply_input_act
 from comfy_kitchen.backends.eager import quantization as eager_quantization
+from comfy_kitchen.backends.eager import mps_int8
 from comfy_kitchen.backends.eager.quantization import (
     _int8_linear_dequant,
     quantize_int8_rowwise,
@@ -18,11 +17,24 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 
 def _has_metal_4_mpp() -> bool:
-    version = platform.mac_ver()[0]
-    if not version:
-        return False
-    major, minor, *_ = (int(part) for part in version.split("."))
-    return (major, minor) >= (26, 2) and hasattr(torch.mps, "compile_shader")
+    return torch.backends.mps.is_available() and mps_int8._supports_metal_int8_tensorops()
+
+
+@pytest.mark.parametrize(
+    ("brand", "expected"),
+    [("Apple M4 Max", False), ("Apple M5", True), ("Apple M6 Pro", True), ("unknown", False)],
+)
+def test_fused_kernel_requires_m5_class_chip(monkeypatch, brand, expected):
+    class Result:
+        returncode = 0
+        stdout = brand
+
+    mps_int8._supports_metal_int8_tensorops.cache_clear()
+    monkeypatch.setattr(mps_int8.subprocess, "run", lambda *_args, **_kwargs: Result())
+    try:
+        assert mps_int8._supports_metal_int8_tensorops() is expected
+    finally:
+        mps_int8._supports_metal_int8_tensorops.cache_clear()
 
 
 def _reference_int8_linear(

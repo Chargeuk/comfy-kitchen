@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import re
+import subprocess
 import threading
 
 import torch
@@ -12,6 +15,30 @@ import torch
 
 class FusedMPSUnsupportedError(RuntimeError):
     """Raised when the fused path cannot handle an input safely."""
+
+
+@functools.cache
+def _supports_metal_int8_tensorops() -> bool:
+    """Return whether this Mac has the M5-class TensorOps used by the shader.
+
+    Metal 4 shader compilation alone is not a sufficient capability check: the
+    shader may compile on an M4 even though its cooperative INT8 operations are
+    not supported correctly. Fail closed when the chip cannot be identified.
+    """
+    if not hasattr(torch.mps, "compile_shader"):
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    match = re.search(r"\bM(\d+)\b", result.stdout)
+    return result.returncode == 0 and match is not None and int(match.group(1)) >= 5
 
 
 _SHADER = r"""
@@ -230,6 +257,8 @@ def int8_linear_bf16(
     """Run row-wise activation quantization and INT8 linear in two Metal kernels."""
     if x.device.type != "mps" or x.dtype != torch.bfloat16:
         raise FusedMPSUnsupportedError("the fused path currently requires BF16 MPS activations")
+    if not _supports_metal_int8_tensorops():
+        raise FusedMPSUnsupportedError("the fused path requires an M5-class Apple GPU")
     if weight.dtype != torch.int8 or weight.dim() != 2:
         raise FusedMPSUnsupportedError("the fused path requires a 2D INT8 weight")
     if x.shape[-1] != weight.shape[-1]:

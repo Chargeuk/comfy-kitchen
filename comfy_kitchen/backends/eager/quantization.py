@@ -748,18 +748,21 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Call the INT8 GEMM operator preferred by this PyTorch version."""
+    if hasattr(torch, "int8_mm"):
+        return torch.int8_mm(lhs, rhs)
+    return torch._int_mm(lhs, rhs)
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
-    def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        if hasattr(torch, "int8_mm"):
-            return torch.int8_mm(lhs, rhs)
-        return torch._int_mm(lhs, rhs)
 
     orig_m = a.size(0)
     orig_n = b.size(1)
     k = a.size(1)
     if orig_m == 0 or k == 0:
-        return fast_int8_mm(a, b)
+        return _fast_int8_mm(a, b)
 
     padded_m = _round_up(max(orig_m, 32), 32) if a.is_cuda else orig_m
     if padded_m != orig_m:
@@ -778,7 +781,7 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         b_padding = torch.zeros((b.size(0), padded_n - orig_n), device=b.device, dtype=b.dtype)
         b = torch.cat((b, b_padding), dim=1)
 
-    result = fast_int8_mm(a, b)
+    result = _fast_int8_mm(a, b)
     if result.size(0) != orig_m or result.size(1) != orig_n:
         result = result[:orig_m, :orig_n]
     return result
@@ -982,7 +985,7 @@ def _device_has_int8_mm(device_type: str) -> bool:
         return True
     try:
         a = torch.zeros((32, 32), dtype=torch.int8, device=device_type)
-        torch._int_mm(a, a)
+        _fast_int8_mm(a, a)
         return True
     except (NotImplementedError, RuntimeError):
         return False
