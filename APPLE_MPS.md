@@ -19,5 +19,6 @@ For ConvRot inputs, the dispatcher rotates the activation once before trying the
 fused kernel. If the fused path is unavailable, it calls the fallback with
 `convrot=False`, preventing a second rotation.
 
-The branch is based on comfy-kitchen v0.2.33 (`e9ea99c`). Install the tested
-commit after ComfyUI's requirements so ComfyUI's PyPI pin does not replace it.
+The branch is based on comfy-kitchen v0.2.33 (`e9ea99c`) and identifies itself
+as `0.2.33+chargeuk.mps1`. Install the tested commit after ComfyUI's requirements
+so ComfyUI's PyPI pin does not replace it.
