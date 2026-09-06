@@ -1044,7 +1044,7 @@ def _int8_linear_dequant(
         if bias is not None:
             y += bias[i:i + chunk]
         out[:, i:i + chunk] = y.to(out_dtype)
-    return out.reshape(x.shape[:-1] + (n,))
+    return out.reshape(*x.shape[:-1], n)
 
 
 def _mps_int8_linear(

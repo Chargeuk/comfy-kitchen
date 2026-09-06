@@ -28,7 +28,7 @@ N, K = 256, 512
 # the output, while the reference multiplies bf16-rounded dequantized weights — different
 # roundings whose element-wise difference is ~2**-9 * sqrt(K) * |x| * |w| (std ~0.06 here,
 # while |y| ~ sqrt(K) ~ 22). atol=0.5 is ~8 sigma; the tight float32 test below pins the math.
-BF16_TOL = dict(rtol=2e-2, atol=0.5)
+BF16_TOL = {"rtol": 2e-2, "atol": 0.5}
 
 
 def _quantized_weight(convrot, seed, device="cpu"):

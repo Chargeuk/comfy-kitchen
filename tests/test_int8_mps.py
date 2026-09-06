@@ -7,8 +7,8 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends._activations import apply_input_act
-from comfy_kitchen.backends.eager import quantization as eager_quantization
 from comfy_kitchen.backends.eager import mps_int8
+from comfy_kitchen.backends.eager import quantization as eager_quantization
 from comfy_kitchen.backends.eager.quantization import (
     _int8_linear_dequant,
     quantize_int8_rowwise,
@@ -79,9 +79,10 @@ def test_dequantized_int8_linear_supports_channel_scales_and_bias(seed):
         False,
         16,
     )
-    expected_weight = weight.to(torch.bfloat16)
-    expected_weight.mul_(weight_scale.to(torch.bfloat16).reshape(-1, 1))
-    expected = torch.nn.functional.linear(x, expected_weight, bias)
+    expected = torch.nn.functional.linear(x, weight.to(torch.bfloat16)).float()
+    expected *= weight_scale
+    expected += bias.float()
+    expected = expected.to(torch.bfloat16)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
