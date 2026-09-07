@@ -21,6 +21,9 @@ _lock = threading.Lock()
 _library = None
 _compile_error = None
 _launch_error = None
+# Paired M4 measurements: large FP16/BF16 tensors benefit; small tensors do
+# not. FP32 output retains the scalar path until separately measured.
+_UNSCALED_VECTOR_MIN_ELEMENTS = 1280 * 1280
 
 
 def _is_out_of_memory(error):
@@ -66,6 +69,32 @@ kernel void decode_{typename}(
     // Match eager: cast both operands to output dtype BEFORE multiplying.
     {typename} decoded = {typename}(decode_fp8_byte(input[i], format));
     output[i] = {typename}(float(decoded) * float(scale[0]));
+}}
+
+kernel void decode_unscaled_{typename}(
+    device const uchar* input [[buffer(0)]],
+    device {typename}* output [[buffer(1)]],
+    constant uint& format [[buffer(2)]],
+    uint i [[thread_position_in_grid]]) {{
+    output[i] = {typename}(decode_fp8_byte(input[i], format));
+}}
+"""
+        if typename != "float":
+            source += f"""
+kernel void decode_unscaled4_{typename}(
+    device const uchar* input [[buffer(0)]],
+    device {typename}* output [[buffer(1)]],
+    constant uint& format [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint thread_index [[thread_position_in_grid]]) {{
+    uint base = thread_index * 4u;
+    uint remaining = count - base;
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {{
+        // Byte loads support unaligned storage offsets. Guard before forming
+        // the last address, including count near the uint32 limit.
+        if (j < remaining) output[base + j] = {typename}(decode_fp8_byte(input[base + j], format));
+    }}
 }}
 """
     return source
@@ -134,6 +163,50 @@ def dequantize_per_tensor_fp8(x, scale, output_type=torch.bfloat16):
 
 
 def decode_fp8(x, output_type=torch.float32):
-    """Unscaled decode entry point for AppleSilicon-FP8 interoperability."""
-    scale = torch.ones((), dtype=output_type, device=x.device)
-    return dequantize_per_tensor_fp8(x, scale, output_type)
+    """Unscaled decode for AppleSilicon-FP8, without a scale allocation/fill.
+
+    This uses the same byte decoder and failure cache as the scaled path, but
+    passes only input/output buffers to Metal. It preserves input shape and
+    only makes byte-domain copies for noncontiguous FP8 views. Large FP16/BF16
+    outputs decode four bytes per thread; other calls retain the scalar path.
+    """
+    global _launch_error
+    if os.environ.get("COMFY_KITCHEN_DISABLE_MPS", "0") == "1":
+        raise MPSFP8UnsupportedError("native MPS backend disabled by environment")
+    if x.device.type != "mps" or not hasattr(torch.mps, "compile_shader"):
+        raise MPSFP8UnsupportedError("FP8 shader requires MPS and compile_shader")
+    if x.dtype not in _FORMATS or output_type not in _OUTPUTS:
+        raise MPSFP8UnsupportedError("unsupported FP8 input or floating output dtype")
+    if x.layout != torch.strided:
+        raise MPSFP8UnsupportedError("FP8 shader requires strided tensors")
+    if torch.is_grad_enabled() and x.requires_grad:
+        raise MPSFP8UnsupportedError("FP8 shader is inference-only")
+    if x.numel() > 2**32 - 1:
+        raise MPSFP8UnsupportedError("FP8 tensor exceeds shader index range")
+    if _launch_error is not None:
+        raise MPSFP8UnsupportedError("FP8 Metal shader disabled after launch failure") from _launch_error
+    output = torch.empty(x.shape, dtype=output_type, device=x.device)
+    if x.numel() == 0:
+        return output
+    raw = x.view(torch.uint8).contiguous()
+    count = x.numel()
+    vector = output_type != torch.float32 and count >= _UNSCALED_VECTOR_MIN_ELEMENTS
+    prefix = "decode_unscaled4_" if vector else "decode_unscaled_"
+    kernel = getattr(_get_library(), prefix + _OUTPUTS[output_type])
+    try:
+        if vector:
+            # int32 is a supported scalar cast. Preserve the uint32 bit pattern
+            # for counts above INT32_MAX, matching the shader's unsigned type.
+            count_bits = count if count < 2**31 else count - 2**32
+            kernel(raw, output, _FORMATS[x.dtype], count_bits,
+                   threads=(count + 3) // 4, arg_casts={2: "int32", 3: "int32"})
+        else:
+            kernel(raw, output, _FORMATS[x.dtype], threads=count, arg_casts={2: "int32"})
+    except RuntimeError as error:
+        # The compatibility LUT needs larger temporaries: do not try it on OOM.
+        if _is_out_of_memory(error):
+            raise
+        with _lock:
+            _launch_error = error
+        raise MPSFP8UnsupportedError("FP8 Metal shader launch failed") from error
+    return output

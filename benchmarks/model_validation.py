@@ -87,6 +87,8 @@ def main():
     ap.add_argument('--skip-apple-patches', action='store_true')
     ap.add_argument('--inspect-only', action='store_true', help='Load and record parameter storage, without inference')
     ap.add_argument('--profile-convrot', action='store_true', help='Intrusive per-operation MPS timings for INT8/INT4 paths')
+    ap.add_argument('--pony-fp8-storage', action='store_true', help='Pony only: pass ComfyUI --fp8_e4m3fn-unet to retain FP8 diffusion weights')
+    ap.add_argument('--profile-fp8', action='store_true', help='Pony only: intrusive Kitchen decoder and node cast timings')
     ap.add_argument('--compare', nargs=2)
     args = ap.parse_args()
     if args.compare:
@@ -96,6 +98,8 @@ def main():
         ap.error('--output is required for inference')
     if args.runs < 1:
         ap.error('--runs must be positive')
+    if (args.pony_fp8_storage or args.profile_fp8) and args.model != 'pony-fp8':
+        ap.error('--pony-fp8-storage and --profile-fp8 require --model pony-fp8')
     model_path = args.model_path or args.comfy / 'models/checkpoints' / MODELS[args.model]
     if not model_path.is_file():
         ap.error(f'Model absent; no download attempted: {model_path}')
@@ -104,7 +108,11 @@ def main():
     sys.path.insert(0, str(args.comfy))
     if args.kitchen_source:
         sys.path.insert(0, str(args.kitchen_source))
-    sys.argv = [sys.argv[0]]  # Keep harness arguments out of Comfy's parser.
+    comfy_arguments = ['--fp8_e4m3fn-unet'] if args.pony_fp8_storage else []
+    sys.argv = [sys.argv[0], *comfy_arguments]  # Keep harness arguments out of Comfy's parser.
+    import comfy.options
+    comfy.options.enable_args_parsing()  # Otherwise cli_args silently parses an empty list.
+    from comfy.cli_args import args as comfy_args
     import torch
     torch.set_grad_enabled(False)
     import numpy as np
@@ -127,7 +135,7 @@ def main():
     shapes = collections.Counter()
     profile = collections.defaultdict(lambda: {'count': 0, 'seconds': 0.0, 'shapes': {}})
     def profile_call(label, fn, *a, **kw):
-        if not args.profile_convrot:
+        if not (args.profile_convrot or args.profile_fp8):
             return fn(*a, **kw)
         sync()
         started = time.perf_counter()
@@ -160,7 +168,7 @@ def main():
                         shapes[f'{_name}:{tuple(a[0].shape)}:{a[0].dtype}'] += 1
                     if len(a) > 1 and isinstance(a[1], torch.Tensor):
                         shapes[f'{_name}:weight={tuple(a[1].shape)}:{a[1].dtype}'] += 1
-                    if _name == '_int8_linear_dequant':
+                    if args.profile_convrot and _name == '_int8_linear_dequant':
                         return profile_call(_name + ':inclusive', _orig, *a, **kw)
                     return _orig(*a, **kw)
                 wrappers[id(original)] = wrapper
@@ -194,7 +202,7 @@ def main():
                 module_name in mps_modules):
             continue
         for name in ('decode_fp8', '_w4a16_linear_mps', 'try_regular_rotation',
-                     'unpack_int4_scaled', 'try_rotate', 'int8_epilogue'):
+                     'unpack_int4_scaled', 'try_rotate', 'int8_epilogue', '_to_compute'):
             original = getattr(module, name, None)
             if original is None:
                 continue
@@ -204,7 +212,10 @@ def main():
                 if a and isinstance(a[0], torch.Tensor):
                     desc = '|'.join(f'{tuple(v.shape)}:{v.dtype}' for v in a[:2] if isinstance(v, torch.Tensor))
                     shapes[f'{_label}:{desc}'] += 1
-                result = profile_call(_label + ':inclusive', _orig, *a, **kw) if '_w4a16_linear_mps' in _label else _orig(*a, **kw)
+                timed = (args.profile_convrot and '_w4a16_linear_mps' in _label) or (
+                    args.profile_fp8 and _label in ('comfy_kitchen.backends.mps.fp8.decode_fp8',
+                                                   'validation_apple_fp8._patches.ops_bias_fp8._to_compute'))
+                result = profile_call(_label + ':inclusive', _orig, *a, **kw) if timed else _orig(*a, **kw)
                 if result is not None:
                     counts[_label + ':success'] += 1
                 return result
@@ -212,9 +223,11 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     report = {'model': str(model_path), 'kitchen': ck.__file__, 'torch': torch.__version__,
               'apple_patches': not args.skip_apple_patches, 'seed': 20260906,
+              'comfy_arguments': comfy_arguments, 'fp8_e4m3fn_unet': comfy_args.fp8_e4m3fn_unet,
+              'profile_fp8': args.profile_fp8, 'profile_convrot': args.profile_convrot,
               'runs': [], 'notes': 'First run cold; subsequent runs warm. Same checkpoint across backends isolates kernel changes.'}
-    if args.profile_convrot:
-        report['profile_note'] = 'Intrusive profiling: each operation synchronizes MPS before and after timing; timings are not comparable to normal runs.'
+    if args.profile_convrot or args.profile_fp8:
+        report['profile_note'] = 'Intrusive profiling: each operation synchronizes MPS before and after timing; timings are not comparable to normal runs. Inclusive timings can be nested and must not be summed.'
     report['thermal_start'] = subprocess.run(['/usr/bin/pmset', '-g', 'therm'], capture_output=True, text=True).stdout
     thermal = Thermal()
     report['thermal_pressure_start'] = thermal.snapshot()
@@ -232,10 +245,14 @@ def main():
         raw = getattr(parameter, '_qdata', parameter)
         storage[f'{type(parameter).__name__}:{raw.dtype}:{raw.device.type}'] += raw.numel()
     report['loaded_storage_elements'] = dict(storage)
-    report['model_compute_dtype'] = str(model.model.get_dtype())
+    report['model_storage_dtype'] = str(model.model.get_dtype())
+    report['model_compute_dtype'] = str(model.model.get_dtype_inference())
+    if args.pony_fp8_storage and model.model.get_dtype() != torch.float8_e4m3fn:
+        raise RuntimeError('Requested Pony FP8 storage was not retained; refusing misleading FP8 timing')
     if args.inspect_only:
         (args.output / 'report.json').write_text(json.dumps(report, indent=2))
-        print(json.dumps({'loaded_storage_elements': dict(storage), 'model_compute_dtype': report['model_compute_dtype']}), flush=True)
+        print(json.dumps({'loaded_storage_elements': dict(storage), 'model_storage_dtype': report['model_storage_dtype'],
+                          'model_compute_dtype': report['model_compute_dtype']}), flush=True)
         return
     if args.model.startswith('sam'):
         from comfy_extras.nodes_sam3 import _extract_text_prompts
@@ -249,7 +266,7 @@ def main():
         text = 'a red balloon'
         conditioning = nodes.CLIPTextEncode().encode(clip, text)[0]
         mm.load_model_gpu(model)
-        dtype, device = model.model.get_dtype(), mm.get_torch_device()
+        dtype, device = model.model.get_dtype_inference(), mm.get_torch_device()
         frame = comfy.utils.common_upscale(image.movedim(-1, 1), 1008, 1008, 'bilinear', crop='disabled').to(device=device, dtype=dtype)
         emb, mask, _ = _extract_text_prompts(conditioning, device, dtype)[0]
         def run():
@@ -282,7 +299,7 @@ def main():
         tensors = {k: v.detach().float().cpu() for k, v in output.items() if isinstance(v, torch.Tensor)}
         profile_json = {k: {'count': v['count'], 'seconds': v['seconds'], 'shapes': dict(v['shapes'])} for k, v in profile.items()}
         report['runs'].append({'seconds': elapsed, 'counts': dict(counts), 'shapes': dict(shapes),
-                               **({'profile': profile_json} if args.profile_convrot else {}),
+                               **({'profile': profile_json} if args.profile_convrot or args.profile_fp8 else {}),
                                'thermal_before': pressure_before, 'thermal_after': thermal.snapshot(),
                                'all_finite': all(bool(torch.isfinite(v).all()) for v in tensors.values()),
                                'mps_allocated_bytes': torch.mps.current_allocated_memory(),

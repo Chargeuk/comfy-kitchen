@@ -78,3 +78,71 @@ index 6dda857..9b44f17 100644
      b = bias.to(device=x2d.device, dtype=x2d.dtype) if bias is not None else None
      y = torch.nn.functional.linear(x_rot, w, b)
      return y.reshape(*orig_shape[:-1], qweight.shape[0])
+diff --git a/_patches/ops_bias_fp8.py b/_patches/ops_bias_fp8.py
+index ec51442..50f577c 100644
+--- a/_patches/ops_bias_fp8.py
++++ b/_patches/ops_bias_fp8.py
+@@ -108,7 +108,7 @@ def _to_compute(param, target_dtype, device):
+         # comfykitchen_fp8 patch already made MPS-safe.
+         return param.dequantize().to(target_dtype)
+     if param.dtype in FP8_DTYPES:
+-        return decode_fp8(param).to(target_dtype)
++        return decode_fp8(param, target_dtype)
+     return param.to(dtype=target_dtype)
+
+
+diff --git a/tests/test_ops_bias_quantized.py b/tests/test_ops_bias_quantized.py
+index 1867585..ec24da0 100644
+--- a/tests/test_ops_bias_quantized.py
++++ b/tests/test_ops_bias_quantized.py
+@@ -51,6 +51,50 @@ class _FakeLayer:
+         self.bias_function = []
+
+
++@requires_mps
++@pytest.mark.parametrize('fp8_dtype', [torch.float8_e4m3fn, torch.float8_e5m2])
++@pytest.mark.parametrize('target', [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize('with_functions', [False, True])
++def test_raw_fp8_cast_requests_target_dtype_and_preserves_offload_contract(
++    patched, monkeypatch, fp8_dtype, target, with_functions
++):
++    """Raw FP8 rescue must decode directly to the requested compute dtype."""
++    raw = torch.arange(256, dtype=torch.uint8).view(fp8_dtype)
++    if with_functions:
++        raw = raw[torch.isfinite(raw.float())]
++    weight = raw.view(torch.uint8).to('mps').view(fp8_dtype)
++    bias = raw.view(torch.uint8).to('mps').view(fp8_dtype)
++    layer = _FakeLayer(weight, bias)
++    seen = []
++    decoder = m.decode_fp8
++    def spy(value, output_type=torch.float32):
++        seen.append(output_type)
++        return decoder(value, output_type)
++    monkeypatch.setattr(m, 'decode_fp8', spy)
++    function_dtypes = []
++    def weight_function(x):
++        function_dtypes.append(x.dtype)
++        return x * 0.5
++    def bias_function(x):
++        function_dtypes.append(x.dtype)
++        return x * 0.25
++    if with_functions:
++        layer.weight_function = [weight_function]
++        layer.bias_function = [bias_function]
++    w, b, stream = ops.cast_bias_weight(layer, device=torch.device('mps'), dtype=target, offloadable=True)
++    assert seen == [target, target]
++    assert w.dtype == target and b.dtype == target
++    assert stream == (None, None, None)
++    expected = raw.float().to(target)
++    expected_w = expected * 0.5 if with_functions else expected
++    expected_b = expected * 0.25 if with_functions else expected
++    for actual, reference in ((w.cpu(), expected_w), (b.cpu(), expected_b)):
++        torch.testing.assert_close(actual, reference, rtol=0, atol=0, equal_nan=True)
++        zeros = reference == 0
++        assert torch.equal(torch.signbit(actual[zeros]), torch.signbit(reference[zeros]))
++    assert function_dtypes == ([target, target] if with_functions else [])
++
++
+ @pytest.fixture
+ def patched():
+     """Install the ops_bias override, then restore the real one.

@@ -20,7 +20,7 @@ fused kernel. If the fused path is unavailable, it calls the fallback with
 `convrot=False`, preventing a second rotation.
 
 The branch is based on comfy-kitchen v0.2.33 (`e9ea99c`) and identifies itself
-as `0.2.33+chargeuk.mps4`. Install the tested commit after ComfyUI's requirements
+as `0.2.33+chargeuk.mps5`. Install the tested commit after ComfyUI's requirements
 so ComfyUI's PyPI pin does not replace it.
 
 ## M4 backend
@@ -54,6 +54,21 @@ performed in byte form on the GPU, avoiding full-size int64 gather indices and
 CPU weight copies. Unsupported shader contracts use a byte-lookup fallback;
 input gradients are explicitly unsupported. CUDA/CPU behavior is unchanged.
 
+Unscaled FP8 decoding has its own entry point without a dummy scale allocation
+or multiplication. FP16/BF16 outputs use four bytes per thread at 1,638,400
+elements and above; smaller tensors and FP32 outputs retain scalar decoding.
+The Apple-node bridge decodes raw parameters directly to the
+requested compute dtype, avoiding an intermediate FP32 tensor and extra cast.
+QuantizedTensor scaling and weight/bias functions retain their existing behavior.
+
+FP8 checkpoint format does not automatically imply FP8 runtime storage. On M4,
+ComfyUI normally expands a model that fits into FP16. Its existing startup option
+`--fp8_e4m3fn-unet` requests FP8 diffusion-model storage instead; with this node
+and Kitchen, weights are decoded for floating-point computation at use. This is
+not native FP8 GEMM and does not require `--supports-fp8-compute`. The storage
+flag is session-wide for automatic diffusion-model dtype selection, not a
+per-checkpoint preference or a text-encoder/VAE precision setting.
+
 NVFP4 decoding reads packed E2M1 weights and directly addresses cuBLAS-swizzled
 E4M3 block scales in Metal. Both nibble orders, byte-safe strided inputs and
 FP16/BF16/FP32 outputs are supported. It preserves the eager implementation's
@@ -71,7 +86,9 @@ matrix multiplication is introduced. MXFP8 retains its existing fallback.
 
 `integrations/applesilicon-fp8-kitchen.patch` is the small companion patch for
 AppleSilicon-FP8 v1.3.2 (`74734a1`): its shared FP8 decoder and INT4 W4A16 path use
-Kitchen when present and retain their original fallbacks otherwise. Apply with `git apply --check`
+Kitchen when present and retain their original fallbacks otherwise. It also
+requests direct-to-compute-dtype raw FP8 conversion, with regression tests for
+both FP8 formats, signed zeros and weight/bias functions. Apply with `git apply --check`
 then `git apply` in that custom-node checkout. It does not remove the node's
 other compatibility fixes and does not modify core ComfyUI.
 
@@ -102,6 +119,13 @@ adds intrusive synchronized stage timings: these diagnose bottlenecks but must
 not be compared with ordinary inference latency. All scripts use local models
 or synthetic tensors without downloading anything.
 
+`model_validation.py --model pony-fp8 --pony-fp8-storage` forwards ComfyUI's
+actual storage flag and records both storage and compute dtype. Add
+`--profile-fp8` only for intrusive diagnostics, not ordinary inference timings.
+`benchmark_mps_fp8_unscaled.py --baseline-module PATH --output PATH` compares
+this decoder with an explicit previous-version module using alternating pairs.
+Keep the old module or extract it from the rollback wheel before updating.
+
 `benchmarks/benchmark_nvfp4_model.py` tests a user-supplied local MiniMax H3 Qwen3-VL
 NVFP4 text encoder without downloading anything. `--mode layer` reads only a
 selected layer, checks decoding and AWQ-scaled linear outputs against a CPU
@@ -115,7 +139,8 @@ snapshots are not peak-memory measurements. Compare output directories with
 Measured results and limits are recorded in [M4_VALIDATION.md](M4_VALIDATION.md)
 for the original FP8/INT8 work, [M4_NVFP4_VALIDATION.md](M4_NVFP4_VALIDATION.md)
 for NVFP4, and [M4_CONVROT_VALIDATION.md](M4_CONVROT_VALIDATION.md) for the mps4
-INT8/INT4 conversion improvements and opt-in SIMD experiment.
+INT8/INT4 conversion improvements and opt-in SIMD experiment. The forced-FP8
+storage follow-up is documented in [M4_FP8_VALIDATION.md](M4_FP8_VALIDATION.md).
 
 The M4 implementation is original code informed by the regular-basis math and
 the approaches in [AppMana's MPS branch](https://github.com/AppMana/forks-comfy-kitchen-m1-m4/tree/mps-backend),
