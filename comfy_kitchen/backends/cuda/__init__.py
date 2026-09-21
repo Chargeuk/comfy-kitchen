@@ -1995,7 +1995,7 @@ def int8_linear(
         and 256 <= k_act <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
     )
-    if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
+    if input_act not in (None, "none") and not _fused_convrot_ok:
         x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
         input_act = None
 
@@ -2032,7 +2032,7 @@ def int8_linear(
         and k % 4 == 0
         and (k <= 2560 or (k == 6144 and n <= 128))
     )
-    if convrot_m1_supported or nonconvrot_m1_supported:
+    if input_act in (None, "none") and (convrot_m1_supported or nonconvrot_m1_supported):
         x_qdata = torch.empty((1, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
@@ -2096,9 +2096,12 @@ def int8_linear(
             stream_ptr,
         )
 
-    if m == 1 and k % 4 == 0:
+    if (m == 1 and k % 4 == 0) or (m == 2 and k % 16 == 0):
+        # The two-row kernel uses 16-byte loads, including for contiguous views.
+        if m == 2 and not _aligned16(weight):
+            weight = weight.clone()
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
+        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
@@ -2311,6 +2314,34 @@ def w4a8_int8_linear(
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     # both the chunked kernels and the 2-pass CUTLASS fallback read bias in the output dtype
     bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
+
+    # Decode fast path: fused in-register dequant GEMV, no int8 workspace round-trip.
+    # Bit-exact with the chunked path (same rounded int8 grid and epilogue).
+    if (
+        _W4A8_CHUNKED
+        and m <= 8
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+        and group_size >= 16
+        and group_size % 16 == 0
+    ):
+        used = _C.w4a8_codebook_gemv(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            wrap_codebook(),
+            _wrap_for_dlpack(s_channel),
+            _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+            _wrap_for_dlpack(out),
+            convrot_groupsize,
+            group_size,
+            output_dtype_code,
+            stream_ptr,
+        )
+        if used:
+            return out.reshape(*x.shape[:-1], n)
 
     chunked = (
         _W4A8_CHUNKED
@@ -4358,3 +4389,4 @@ def _register():
 
 
 _register()
+
