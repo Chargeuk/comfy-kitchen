@@ -64,6 +64,7 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
@@ -117,6 +118,8 @@ __all__ = [
     "gemv_awq_w4a16",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -165,6 +168,12 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def _call_backend(name: str, kwargs: dict):
+    """Dispatch a thin public wrapper whose signature matches its backends."""
+    impl = registry.get_implementation(name, kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def sol_attn(
@@ -987,6 +996,29 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _mm_int8(a, b)
 
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Compute ``residual + gate * rms_norm(activation, norm_weight)``.
+
+    Each step is rounded to the input dtype as in the unfused PyTorch ops.
+    """
+    return _call_backend(
+        "rms_gated_residual",
+        {
+            "activation": activation,
+            "norm_weight": norm_weight,
+            "residual": residual,
+            "gate": gate,
+            "eps": eps,
+        },
+    )
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1086,6 +1118,66 @@ def int8_linear(
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Batch-one modulation with fused INT8 quantization."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 projection with RMSNorm and batch-one modulation in its producer."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
 
 
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

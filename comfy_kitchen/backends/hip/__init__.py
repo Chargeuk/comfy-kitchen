@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
+"""HIP backend for AMD RDNA2, RDNA3/3.5, RDNA4 and gfx117x.
 
 Every matmul is a WMMA kernel compiled from the sources in this directory; the
 backend does not link or call hipBLAS/hipBLASLt.
@@ -64,6 +64,7 @@ __all__ = [
     "fp16_conv3d_out",
     "fp16_linear",
     "gemv_awq_w4a16",
+    "rms_gated_residual",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
@@ -89,6 +90,8 @@ __all__ = [
     "flash_attention_decode_is_available",
     "flash_attention_decode_gqa_is_available",
     "flash_decode",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "flash_decode_gqa",
     "flash_decode_tree_merge",
     "gated_delta_decode_fused",
@@ -179,8 +182,8 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
+# RDNA2 has no matrix cores; RDNA3/3.5, gfx117x and RDNA4 do. This exact manifest
+# is also consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
 # compiler-recognized target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
@@ -188,9 +191,15 @@ _ARCH_GROUPS = json.loads(
 )
 _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
+_ARCH_WMMA_GFX117 = frozenset(_ARCH_GROUPS.get("wmma_gfx117", []))
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
-_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+
+def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
+    """Whether WMMA operands use the gfx12 128-bit layout."""
+    return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
+
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
@@ -202,6 +211,8 @@ _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d_out",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "na3d",
     "sol_attn",
     "convrot_w4a4_linear",
@@ -546,6 +557,27 @@ def dequantize_int8_convrot_weight_dtype(
 # Keyed by device and dtype: convrot_max_k() reports the LDS budget of whichever
 # device is current and FP32 rows consume twice the LDS of FP16/BF16 rows.
 _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
+_CONVROT_SPILL_WORKSPACE_BYTES = 32 << 20
+
+
+def _convrot_int8_needs_spill(
+    m: int, k: int, input_dtype_code: int, device: torch.device
+) -> bool:
+    """Query the ConvRot capability for the operand's device."""
+    with torch.cuda.device(device):
+        return bool(_C.convrot_int8_needs_spill(m, k, input_dtype_code))
+
+
+def _convrot_row_max_k(device: torch.device, dtype: torch.dtype) -> int:
+    """The widest row ``device``'s LDS can stage in ``dtype``, cached per device."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, dtype)
+    max_k = _convrot_max_k.get(key)
+    if max_k is None:
+        with torch.cuda.device(index):
+            max_k = _C.convrot_max_k(DTYPE_TO_CODE[dtype])
+        _convrot_max_k[key] = max_k
+    return max_k
 
 
 def _convrot_supported(
@@ -566,48 +598,129 @@ def _convrot_supported(
         return False
     if group_size == 256 and int8_global_spill:
         return True
-
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, dtype)
-    max_k = _convrot_max_k.get(key)
-    if max_k is None:
-        with torch.cuda.device(index):
-            max_k = _C.convrot_max_k(DTYPE_TO_CODE[dtype])
-        _convrot_max_k[key] = max_k
+    max_k = _convrot_row_max_k(device, dtype)
     return max_k > 0 and k <= max_k
 
 
 def _rotate_quant_int8(
     x2d: torch.Tensor, group_size: int, input_act: str | None = None,
     act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
+    *, tiled_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
     # swiglu and situ halve the row: the input is twice the quantized width.
     k = k_in // _input_act_width(input_act)
-    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     x_arg = _operand(x2d, x2d.device, "x2d")
-    spill_rotated = None
-    spill_partials = None
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
-        if group_size == 256 and _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype]):
-            spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
-            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
-        _C.quantize_int8_convrot(
-            _dl(x_arg),
-            _dl(q),
-            _dl(scales),
-            None if spill_rotated is None else _dl(spill_rotated),
-            None if spill_partials is None else _dl(spill_partials),
-            m,
-            k,
-            group_size,
-            _input_act_code(input_act),
-            _stream(x2d),
-            None if act_weight is None else _dl(act_weight),
-            float(act_eps),
+        if group_size != 256 or not _convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x2d.dtype], x2d.device
+        ):
+            _C.quantize_int8_convrot(
+                _dl(x_arg), _dl(q), _dl(scales),
+                None, None, m, k,
+                group_size, _input_act_code(input_act), _stream(x2d),
+                None if act_weight is None else _dl(act_weight),
+                float(act_eps), tiled_output,
+            )
+            return q, scales
+
+        workspace_per_row = x_arg.element_size() * k + 4 * (k // 256)
+        # Tiled chunks start on an M-tile boundary. Reserve at least one tile
+        # of workspace, just as the row-major path reserves at least one row.
+        row_unit = 128 if tiled_output else 1
+        units = (m + row_unit - 1) // row_unit
+        unit_cap = max(1, _CONVROT_SPILL_WORKSPACE_BYTES // (workspace_per_row * row_unit))
+        capacity_chunk_count = (units + unit_cap - 1) // unit_cap
+        # For wide rows the native policy picks the global implementation at
+        # 96 rows or more; a shorter chunk would switch to the one-wave LDS
+        # schedule. Balance row-major chunks to avoid that switch when the
+        # workspace cap allows it. Tiled chunks must keep 128-row boundaries,
+        # so their final tail may still use the LDS schedule.
+        balanced_chunk_count = min(capacity_chunk_count, max(1, m // 96))
+        balanced_chunk_rows = (
+            units + balanced_chunk_count - 1
+        ) // balanced_chunk_count * row_unit
+        chunk_count = (
+            balanced_chunk_count
+            if balanced_chunk_rows <= unit_cap * row_unit
+            else capacity_chunk_count
+        )
+        chunk_rows = min(m, (units + chunk_count - 1) // chunk_count * row_unit)
+        spill_rotated = torch.empty(
+            (chunk_rows, k), dtype=x_arg.dtype, device=x2d.device
+        )
+        spill_partials = torch.empty(
+            (chunk_rows, k // 256), dtype=torch.float32, device=x2d.device
+        )
+        start = 0
+        for chunk in range(chunk_count):
+            rows = min(m - start, (units // chunk_count + (chunk < units % chunk_count)) * row_unit)
+            end = start + rows
+            q_end = start + (rows + row_unit - 1) // row_unit * row_unit
+            _C.quantize_int8_convrot(
+                # Row slices of x and q start on a 256-byte multiple (K % 256 == 0);
+                # the kernel writes scales[row] as scalars, so the scales slice needs
+                # no alignment. Output slices must be passed as views, never copied.
+                _dl(x_arg[start:end]),
+                _dl(q[start:q_end]),
+                _dl(scales[start:end]),
+                _dl(spill_rotated),
+                _dl(spill_partials),
+                rows,
+                k,
+                group_size,
+                _input_act_code(input_act),
+                _stream(x2d),
+                None if act_weight is None else _dl(act_weight),
+                float(act_eps),
+                tiled_output,
+            )
+            start = end
+    return q, scales
+
+
+def _rotate_quant_int8_modulated(
+    x2d: torch.Tensor, modulation_scale: torch.Tensor, group_size: int,
+    *, tiled_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold exact twice-rounded BF16 batch-one modulation into ConvRot."""
+    m, k = x2d.shape
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
+    scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
+    with torch.cuda.device(x2d.device):
+        _C.quantize_int8_convrot_modulated(
+            _dl(_aligned(x2d)), _dl(_aligned(modulation_scale)),
+            _dl(q), _dl(scales),
+            m, k, group_size, _stream(x2d), tiled_output,
+        )
+    return q, scales
+
+
+def _rotate_quant_int8_rms_modulated(
+    x2d: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    group_size: int,
+    *, tiled_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold exact BF16 RMSNorm and modulation into the ConvRot producer."""
+    m, k = x2d.shape
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
+    scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
+    with torch.cuda.device(x2d.device):
+        _C.quantize_int8_convrot_rms_modulated_fused_stats(
+            _dl(_aligned(x2d)), _dl(_aligned(norm_weight)),
+            _dl(_aligned(modulation_scale)), _dl(q),
+            _dl(scales), m, k, group_size, norm_eps, _stream(x2d),
+            tiled_output,
         )
     return q, scales
 
@@ -622,7 +735,7 @@ def _fused_rms_norm_ok(x: torch.Tensor, convrot: bool, group_size: int) -> bool:
         return False
     # the spill answer reads the current device's LDS budget, as in _rotate_quant_int8
     with torch.cuda.device(x.device):
-        return not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype])
+        return not _convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype], x.device)
 
 
 def quantize_and_rotate_rowwise(
@@ -740,6 +853,11 @@ def fp16_linear(
 _HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu", "situ")
 
 
+def _use_tiled_int8(m: int, n: int, k: int, device: torch.device) -> bool:
+    # Keep the small-M GEMV and the narrow/partial-K row-major tiles.
+    return m > 8 and n > 64 and k > 0 and k % 128 == 0 and _has_nonduplicated_wmma(device)
+
+
 def _split_input_act(
     x: torch.Tensor,
     input_act: str | None,
@@ -807,6 +925,7 @@ def int8_linear(
     m = x2d.shape[0]
     k = k_act
     n = weight.shape[0]
+    tiled = _use_tiled_int8(m, n, k, x.device)
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
     if k % 16 != 0:
@@ -823,33 +942,232 @@ def int8_linear(
             k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
         ):
             return _eager.int8_linear(
-                x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+                x2d.reshape(*orig_shape[:-1], x2d.shape[-1]),
+                weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act, residual=residual, residual_scale=residual_scale,
             )
-        # The only route that absorbs the activation; the rest apply it eagerly.
         q, x_scale = _rotate_quant_int8(
-            x2d, convrot_groupsize, input_act, act_weight, input_act_eps)
+            x2d, convrot_groupsize, input_act, act_weight, input_act_eps,
+            tiled_output=tiled)
     else:
         x2d = _apply_input_act(x2d, input_act)
-        q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+        q_rows = (m + 127) // 128 * 128 if tiled else m
+        q = torch.empty((q_rows, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
-        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x))
+        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
 
     x_scale = x_scale.reshape(-1).contiguous()
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
-        _dl(q), _dl(weight), _dl(out),
-        _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
+        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+        0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias), m, n, k,
+        DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
+
+
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
+) -> torch.Tensor:
+    """Exact BF16 RMSNorm, gate multiplication, and residual add."""
+    width = activation.shape[-1] if activation.ndim else 0
+    max_k = 0
+    if activation.dtype == torch.bfloat16 and activation.device.type == "cuda":
+        max_k = _convrot_row_max_k(activation.device, activation.dtype)
+    use_fused = (
+        activation.dtype == torch.bfloat16
+        and norm_weight.dtype == torch.bfloat16
+        and residual.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and activation.device == norm_weight.device == residual.device == gate.device
+        and activation.ndim == 3
+        and activation.shape[0] == 1
+        and activation.shape == residual.shape
+        and width > 0
+        and width % 4 == 0
+        and width <= max_k
+        and norm_weight.numel() == width
+        and norm_weight.shape[-1] == width
+        and gate.numel() == width
+        and gate.shape[-1] == width
+    )
+    if not use_fused:
+        return _eager.rms_gated_residual(
+            activation, norm_weight, residual, gate, eps
+        )
+
+    shape = activation.shape
+    activation_2d = activation.reshape(-1, width).contiguous()
+    norm_weight_1d = norm_weight.reshape(-1).contiguous()
+    residual_2d = residual.reshape(-1, width).contiguous()
+    gate_1d = gate.reshape(-1).contiguous()
+    output = torch.empty_like(activation_2d)
+    _C.rms_gated_residual_bf16(
+        _dl(_aligned(activation_2d)), _dl(_aligned(norm_weight_1d)),
+        _dl(_aligned(residual_2d)), _dl(_aligned(gate_1d)), _dl(output),
+        activation_2d.shape[0], width,
+        float(eps), _stream(activation),
+    )
+    return output.reshape(shape)
+
+
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 projection with batch-one BF16 modulation in its ConvRot load."""
+    k = x.shape[-1]
+    if k != weight.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {k} and {weight.shape[-1]}"
+        )
+    if modulation_scale.numel() != k:
+        raise ValueError(
+            f"modulation_scale must contain one batch-one row of {k} values, "
+            f"got {modulation_scale.numel()}"
+        )
+
+    modulation_scale = modulation_scale.to(device=x.device).reshape(-1).contiguous()
+    orig_shape = x.shape
+    x2d = x.reshape(-1, k).contiguous()
+    m = x2d.shape[0]
+    n = weight.shape[0]
+    use_fused = (
+        _has_nonduplicated_wmma(x.device)
+        and x2d.dtype == torch.bfloat16
+        and modulation_scale.dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and convrot
+        and convrot_groupsize == 256
+        and k == 3840
+        and n == 11520
+    )
+    if not use_fused:
+        scale_shape = (1,) * (x.ndim - 1) + (k,)
+        modulated = x * (1.0 + modulation_scale.reshape(scale_shape))
+        return int8_linear(
+            modulated, weight, weight_scale, bias, out_dtype,
+            convrot, convrot_groupsize,
+        )
+
+    weight = _aligned(weight.to(device=x.device).contiguous())
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got "
+            f"{tuple(weight_scale.shape)}"
+        )
+    if bias is not None:
+        bias = _bias_operand(bias, n, x.device)
+
+    tiled = _use_tiled_int8(m, n, k, x.device)
+    q, x_scale = _rotate_quant_int8_modulated(
+        x2d, modulation_scale, convrot_groupsize, tiled_output=tiled,
+    )
+    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
+        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+        0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+    )
+    return out.reshape(*orig_shape[:-1], n)
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 QKV projection with exact RMSNorm and modulation in ConvRot."""
+    k = x.shape[-1]
+    if k != weight.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {k} and {weight.shape[-1]}"
+        )
+    if norm_weight.numel() != k or modulation_scale.numel() != k:
+        raise ValueError(
+            f"norm_weight and modulation_scale must each contain {k} values"
+        )
+
+    norm_weight = norm_weight.to(device=x.device).reshape(-1).contiguous()
+    modulation_scale = modulation_scale.to(device=x.device).reshape(-1).contiguous()
+    orig_shape = x.shape
+    x2d = x.reshape(-1, k).contiguous()
+    m = x2d.shape[0]
+    n = weight.shape[0]
+    use_fused = (
+        _has_nonduplicated_wmma(x.device)
+        and x2d.dtype == torch.bfloat16
+        and norm_weight.dtype == torch.bfloat16
+        and modulation_scale.dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and convrot
+        and convrot_groupsize == 256
+        and k == 3840
+        and n == 11520
+    )
+    if not use_fused:
+        normalized = torch.nn.functional.rms_norm(
+            x, (k,), norm_weight, norm_eps
+        )
+        return int8_linear_modulated(
+            normalized, modulation_scale, weight, weight_scale, bias,
+            out_dtype, convrot, convrot_groupsize,
+        )
+
+    weight = _aligned(weight.to(device=x.device).contiguous())
+    weight_scale = weight_scale.to(
+        device=x.device, dtype=torch.float32
+    ).reshape(-1)
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got "
+            f"{tuple(weight_scale.shape)}"
+        )
+    if bias is not None:
+        bias = _bias_operand(bias, n, x.device)
+
+    tiled = _use_tiled_int8(m, n, k, x.device)
+    q, x_scale = _rotate_quant_int8_rms_modulated(
+        x2d, norm_weight, norm_eps, modulation_scale, convrot_groupsize,
+        tiled_output=tiled,
+    )
+    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
+        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+        0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+    )
+    return out.reshape(*orig_shape[:-1], n)
 
 
 # ---------------------------------------------------------------------------
@@ -2610,6 +2928,18 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 return ValidationResult.fail("q", "grid dims exceed HIP limits")
         return ValidationResult.ok()
 
+    bf16_param = ParamConstraint(dtypes=frozenset({torch.bfloat16}))
+    out_param = ParamConstraint(dtypes=out_floats)
+    int8_2d = ParamConstraint(
+        dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+    )
+    divisible_bf16 = ParamConstraint(
+        dtypes=frozenset({torch.bfloat16}), shape_rules=(DivisibleBy(-1, 16),)
+    )
+
+    def fusion(params):
+        return FunctionConstraints(params=params, default_devices=dev)
+
     constraints = {
         "sol_attn": FunctionConstraints(
             params={
@@ -2707,6 +3037,21 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
         ),
+        "rms_gated_residual": fusion({
+            "activation": bf16_param, "norm_weight": bf16_param,
+            "residual": bf16_param, "gate": bf16_param,
+            "eps": ParamConstraint(dtypes=frozenset({float})),
+        }),
+        "int8_linear_modulated": fusion({
+            "x": divisible_bf16, "modulation_scale": bf16_param,
+            "weight": int8_2d,
+            "out_dtype": out_param,
+        }),
+        "int8_linear_rms_modulated": fusion({
+            "x": divisible_bf16, "norm_weight": bf16_param,
+            "modulation_scale": bf16_param, "weight": int8_2d,
+            "out_dtype": out_param,
+        }),
         "quantize_w4a8_int8_weight": FunctionConstraints(
             params={
                 "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
