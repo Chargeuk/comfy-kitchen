@@ -7,7 +7,7 @@
 //   stats_partial:  per (frame, 1024-row chunk, channel) sum / sum of squares
 //   stats_finalize: reduce to per-group mean, rstd
 //   apply:          normalize, silu, store into the padded output (reflected indices)
-// C % 8 == 0 (16-byte vectors). fp32 partial sums reduced in double, so results
+// C % 8 == 0 (16-byte vectors), C <= 2048. fp32 partial sums reduced in double, so results
 // agree with torch's Welford to fp32 rounding, not bitwise.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -39,22 +39,23 @@ __device__ __forceinline__ int reflect_index(int i, int n) {
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
 stats_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
-                     int64_t rows, int C, int chunks) {
+                     int64_t rows, int C, int chunks, int W, int64_t row_stride) {
+    // rows counts pixels; an image row of W pixels is row_stride elements apart (W * C when packed)
     const int cv = C / kVec;
-    const int rows_per_iter = kThreads / cv;
+    const int rows_per_iter = blockDim.x / cv;  // launched with the largest multiple of cv <= kThreads
     const int frame = blockIdx.y;
     const int chunk = blockIdx.x;
     const int cvec = threadIdx.x % cv;
     const int r0 = threadIdx.x / cv;
     const int64_t row_begin = static_cast<int64_t>(chunk) * kChunkRows;
     const int64_t row_end = min(row_begin + kChunkRows, rows);
-    const T* base = x + frame * rows * C + cvec * kVec;
+    const T* base = x + frame * (rows / W) * row_stride + cvec * kVec;
 
     float s[kVec], ss[kVec];
 #pragma unroll
     for (int i = 0; i < kVec; ++i) { s[i] = 0.f; ss[i] = 0.f; }
     for (int64_t r = row_begin + r0; r < row_end; r += rows_per_iter) {
-        uint4 raw = *reinterpret_cast<const uint4*>(base + r * C);
+        uint4 raw = *reinterpret_cast<const uint4*>(base + (r / W) * row_stride + (r % W) * C);
         const T* v = reinterpret_cast<const T*>(&raw);
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {
@@ -100,12 +101,12 @@ __global__ void stats_finalize_kernel(const float2* __restrict__ partial, float2
                                        rsqrtf(static_cast<float>(var) + eps));
 }
 
-template <typename T, bool kNorm, bool kSilu>
+template <typename T, bool kNorm, bool kSilu, bool kZeroPad>
 __global__ void __launch_bounds__(kThreads)
 apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
              const T* __restrict__ gamma, const T* __restrict__ beta, T* __restrict__ out,
              int T_in, int H, int W, int C, int G,
-             int T_out, int H_out, int W_out, int left, int top, int front) {
+             int T_out, int H_out, int W_out, int left, int top, int front, int64_t row_stride) {
     extern __shared__ float sh[];
     float* a = sh;
     float* b = sh + C;
@@ -137,9 +138,16 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
 
     const int orow = static_cast<int>(idx / cv);
     const int c0 = static_cast<int>(idx % cv) * kVec;
-    const int y = reflect_index(orow / W_out - top, H);
-    const int xx = reflect_index(orow % W_out - left, W);
-    const T* src = x + ((static_cast<int64_t>(iframe) * H + y) * W + xx) * C + c0;
+    const int y0 = orow / W_out - top;
+    const int x0 = orow % W_out - left;
+    if (kZeroPad && (y0 < 0 || y0 >= H || x0 < 0 || x0 >= W)) {
+        // zero border, for models whose convolutions pad with zeros rather than reflecting
+        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    const int y = kZeroPad ? y0 : reflect_index(y0, H);
+    const int xx = kZeroPad ? x0 : reflect_index(x0, W);
+    const T* src = x + (static_cast<int64_t>(iframe) * H + y) * row_stride + static_cast<int64_t>(xx) * C + c0;
 
     uint4 raw = *reinterpret_cast<const uint4*>(src);
     T* v = reinterpret_cast<T*>(&raw);
@@ -154,21 +162,33 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
 }
 
 template <typename T>
-void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* workspace,
+void stats_typed(const T* x, float2* partial, float2* stats, int frames, int C, int H, int W, int G, float eps,
+                 int64_t row_stride, cudaStream_t stream) {
+    const int64_t rows = static_cast<int64_t>(H) * W;
+    const int chunks = static_cast<int>((rows + kChunkRows - 1) / kChunkRows);
+    const int cv = C / kVec;
+    stats_partial_kernel<T><<<dim3(chunks, frames), (kThreads / cv) * cv, 0, stream>>>(
+        x, partial, rows, C, chunks, W, row_stride);
+    stats_finalize_kernel<<<frames, G, 0, stream>>>(
+        partial, stats, C, G, chunks, static_cast<double>(rows) * (C / G), eps);
+}
+
+template <typename T>
+void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* workspace, const float2* stats_in,
                   int B, int C, int T_in, int H, int W, int G, float eps,
-                  int left, int right, int top, int bottom, int front, bool silu,
-                  cudaStream_t stream) {
+                  int left, int right, int top, int bottom, int front, bool silu, bool zero_pad,
+                  int64_t row_stride, cudaStream_t stream) {
     const bool norm = gamma != nullptr;
     const int frames = B * T_in;
     const int64_t rows = static_cast<int64_t>(H) * W;
     const int chunks = static_cast<int>((rows + kChunkRows - 1) / kChunkRows);
-    float2* partial = workspace;
-    float2* stats = workspace + static_cast<int64_t>(frames) * chunks * C;
+    const float2* stats = stats_in;
 
-    if (norm) {
-        stats_partial_kernel<T><<<dim3(chunks, frames), kThreads, 0, stream>>>(x, partial, rows, C, chunks);
-        stats_finalize_kernel<<<frames, G, 0, stream>>>(
-            partial, stats, C, G, chunks, static_cast<double>(rows) * (C / G), eps);
+    if (norm && stats_in == nullptr) {
+        // whole-frame statistics; a caller normalizing strips of a frame passes its own
+        float2* own = workspace + static_cast<int64_t>(frames) * chunks * C;
+        stats_typed<T>(x, workspace, own, frames, C, H, W, G, eps, row_stride, stream);
+        stats = own;
     }
 
     const int T_out = T_in + front;
@@ -177,31 +197,61 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const int64_t out_vecs = static_cast<int64_t>(H_out) * W_out * (C / kVec);
     const dim3 grid(static_cast<unsigned>((out_vecs + kThreads - 1) / kThreads), B * T_out);
     const size_t smem = norm ? 2 * C * sizeof(float) : 0;
-#define LAUNCH_APPLY(N, S)                                                            \
-    apply_kernel<T, N, S><<<grid, kThreads, smem, stream>>>(                          \
-        x, stats, gamma, beta, out, T_in, H, W, C, G, T_out, H_out, W_out, left, top, front)
-    if (norm && silu) LAUNCH_APPLY(true, true);
-    else if (norm) LAUNCH_APPLY(true, false);
-    else if (silu) LAUNCH_APPLY(false, true);
-    else LAUNCH_APPLY(false, false);
+#define LAUNCH_APPLY(N, S, Z)                                                         \
+    apply_kernel<T, N, S, Z><<<grid, kThreads, smem, stream>>>(                       \
+        x, stats, gamma, beta, out, T_in, H, W, C, G, T_out, H_out, W_out, left, top, front, row_stride)
+    if (zero_pad) {
+        if (norm && silu) LAUNCH_APPLY(true, true, true);
+        else if (norm) LAUNCH_APPLY(true, false, true);
+        else if (silu) LAUNCH_APPLY(false, true, true);
+        else LAUNCH_APPLY(false, false, true);
+    } else {
+        if (norm && silu) LAUNCH_APPLY(true, true, false);
+        else if (norm) LAUNCH_APPLY(true, false, false);
+        else if (silu) LAUNCH_APPLY(false, true, false);
+        else LAUNCH_APPLY(false, false, false);
+    }
 #undef LAUNCH_APPLY
 }
 
 }  // namespace
 
-// x/out NDHWC; gamma/beta [C] or both nullptr for pad-only;
-// workspace (B*T*ceil(H*W/1024)*C + B*T*G) float2, unused without gamma.
-extern "C" void launch_group_norm_silu_pad3d(
-    const void* x, const void* gamma, const void* beta, void* out, void* workspace,
-    int B, int C, int T, int H, int W, int G, float eps,
-    int left, int right, int top, int bottom, int front, bool silu,
+// Per-frame GroupNorm statistics only: stats [B*T*G] float2 (mean, rstd), workspace
+// B*T*ceil(H*W/1024)*C float2. Feeds launch_group_norm_silu_pad3d's stats_in for strips.
+// row_stride: elements between image rows (W * C when packed; larger for a row-interleaved view).
+extern "C" void launch_group_norm_stats3d(
+    const void* x, void* workspace, void* stats,
+    int B, int C, int T, int H, int W, int G, float eps, int64_t row_stride,
     int dtype_code, cudaStream_t stream) {
-    if (C % kVec != 0 || kThreads % (C / kVec) != 0 || (gamma != nullptr && (C % G != 0 || G > 1024))) {
+    if (C % kVec != 0 || C / kVec > kThreads || C % G != 0 || G > 1024) {
+        throw std::runtime_error("group_norm_stats3d: unsupported channel/group count");
+    }
+    if (static_cast<int64_t>(B) * T > 65535) {
+        throw std::runtime_error("group_norm_stats3d: batch * frames must be <= 65535");
+    }
+    DISPATCH_HALF_DTYPE(dtype_code, DT, [&] {
+        stats_typed<DT>(static_cast<const DT*>(x), static_cast<float2*>(workspace), static_cast<float2*>(stats),
+                        B * T, C, H, W, G, eps, row_stride, stream);
+    });
+}
+
+// x/out NDHWC; gamma/beta [C] or both nullptr for pad-only;
+// workspace (B*T*ceil(H*W/1024)*C + B*T*G) float2, unused without gamma or with stats_in;
+// stats_in [B*T*G] float2 from launch_group_norm_stats3d, or nullptr to compute them here.
+extern "C" void launch_group_norm_silu_pad3d(
+    const void* x, const void* gamma, const void* beta, void* out, void* workspace, const void* stats_in,
+    int B, int C, int T, int H, int W, int G, float eps,
+    int left, int right, int top, int bottom, int front, bool silu, bool zero_pad, int64_t row_stride,
+    int dtype_code, cudaStream_t stream) {
+    if (C % kVec != 0 || C / kVec > kThreads || (gamma != nullptr && (C % G != 0 || G > 1024))) {
         throw std::runtime_error("group_norm_silu_pad3d: unsupported channel/group count");
     }
-    if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0
-        || left >= W || right >= W || top >= H || bottom >= H) {
-        throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative and smaller than the input");
+    if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0) {
+        throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative");
+    }
+    // reflection needs a row to mirror; a zero border reads nothing
+    if (!zero_pad && (left >= W || right >= W || top >= H || bottom >= H)) {
+        throw std::runtime_error("group_norm_silu_pad3d: reflect padding must be smaller than the input");
     }
     // frames ride on grid.y; an oversize launch would fail silently and return `out` uninitialized
     if (static_cast<int64_t>(B) * (T + front) > 65535) {
@@ -211,14 +261,16 @@ extern "C" void launch_group_norm_silu_pad3d(
         case comfy::DTYPE_CODE_FLOAT16:
             launch_typed<half>(static_cast<const half*>(x), static_cast<const half*>(gamma),
                                static_cast<const half*>(beta), static_cast<half*>(out),
-                               static_cast<float2*>(workspace), B, C, T, H, W, G, eps,
-                               left, right, top, bottom, front, silu, stream);
+                               static_cast<float2*>(workspace), static_cast<const float2*>(stats_in),
+                               B, C, T, H, W, G, eps,
+                               left, right, top, bottom, front, silu, zero_pad, row_stride, stream);
             break;
         case comfy::DTYPE_CODE_BFLOAT16:
             launch_typed<nv_bfloat16>(static_cast<const nv_bfloat16*>(x), static_cast<const nv_bfloat16*>(gamma),
                                       static_cast<const nv_bfloat16*>(beta), static_cast<nv_bfloat16*>(out),
-                                      static_cast<float2*>(workspace), B, C, T, H, W, G, eps,
-                                      left, right, top, bottom, front, silu, stream);
+                                      static_cast<float2*>(workspace), static_cast<const float2*>(stats_in),
+                                      B, C, T, H, W, G, eps,
+                                      left, right, top, bottom, front, silu, zero_pad, row_stride, stream);
             break;
         default:
             throw std::runtime_error("group_norm_silu_pad3d: only float16 and bfloat16 are supported");
