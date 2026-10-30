@@ -177,6 +177,8 @@ def _build_constraints() -> dict:
                 "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
             },
             default_devices=cuda_devices,
+            # cvt.rn.satfinite.e2m1x2.f32 is a Blackwell/SM100 instruction.
+            min_compute_capability=(10, 0),
         ),
         "quantize_mxfp8": FunctionConstraints(
             params={

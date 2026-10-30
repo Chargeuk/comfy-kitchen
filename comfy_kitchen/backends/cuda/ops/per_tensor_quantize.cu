@@ -19,6 +19,7 @@
 #include "dtype_dispatch.cuh"
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -85,7 +86,10 @@ __global__ void dequantize_fp8_tensor_kernel(
         return;
     }
 
-    const InputType *vals = load_f8x8(src + idx);
+    // Exactly eight FP8 bytes are consumed. The generic helper loads a
+    // float4 (16 bytes), which can overread the last vector or an offset view.
+    const float2 packed = *reinterpret_cast<const float2*>(src + idx);
+    const InputType *vals = reinterpret_cast<const InputType*>(&packed);
 
     // For 16-bit output types (FP16/BF16), use vectorized float4 store (8 values = 16 bytes)
     // For 32-bit output types (FP32), use two float4 stores (8 values = 32 bytes)
@@ -115,6 +119,27 @@ __global__ void dequantize_fp8_tensor_kernel(
 
         reinterpret_cast<float4*>(dst + idx)[0] = f4_f32.f4[0];
         reinterpret_cast<float4*>(dst + idx)[1] = f4_f32.f4[1];
+    }
+}
+
+// Offset views and incomplete vectors are valid tensor inputs. Handle them
+// elementwise without changing the aligned, full-vector production fast paths.
+template<typename InputType, typename OutputType>
+__global__ void quantize_fp8_tensor_scalar_kernel(
+    const InputType *src, OutputType *dst, const float *scale_f, const uint32_t size) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        constexpr float maximum = FP8LimitsTrait<OutputType>::max;
+        dst[idx] = static_cast<OutputType>(clamp(static_cast<float>(src[idx]) / *scale_f, -maximum, maximum));
+    }
+}
+
+template<typename InputType, typename OutputType>
+__global__ void dequantize_fp8_tensor_scalar_kernel(
+    const InputType *src, OutputType *dst, const float *scale_f, const uint32_t size) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        dst[idx] = static_cast<OutputType>(static_cast<float>(src[idx]) * *scale_f);
     }
 }
 
@@ -193,12 +218,19 @@ void launch_quantize_fp8_kernel(
     DISPATCH_INPUT_FP8_OUTPUT_DTYPES(
         input_dtype_code, output_dtype_code, 
         InputType, OutputType, [&] {
-            comfy::quantize_fp8_tensor_kernel<InputType, OutputType>
-                <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<OutputType*>(output),
-                    scale_f,
-                    numel);
+            const bool vector_safe = numel % vals_per_thread == 0
+                && reinterpret_cast<uintptr_t>(input) % alignof(float4) == 0
+                && reinterpret_cast<uintptr_t>(output) % alignof(float4) == 0;
+            if (vector_safe) {
+                comfy::quantize_fp8_tensor_kernel<InputType, OutputType>
+                    <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
+                        static_cast<const InputType*>(input), static_cast<OutputType*>(output), scale_f, numel);
+            } else {
+                const int scalar_blocks = static_cast<int>((numel + comfy::kQMaxKernelThreads - 1) / comfy::kQMaxKernelThreads);
+                comfy::quantize_fp8_tensor_scalar_kernel<InputType, OutputType>
+                    <<<scalar_blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
+                        static_cast<const InputType*>(input), static_cast<OutputType*>(output), scale_f, numel);
+            }
         });
     
     // Check for kernel launch errors
@@ -233,12 +265,19 @@ void launch_dequantize_fp8_kernel(
     DISPATCH_FP8_INPUT_FP_OUTPUT_DTYPES(
         input_dtype_code, output_dtype_code,
         InputType, OutputType, [&] {
-            comfy::dequantize_fp8_tensor_kernel<InputType, OutputType>
-                <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<OutputType*>(output),
-                    scale_f,
-                    numel);
+            const bool vector_safe = numel % vals_per_thread == 0
+                && reinterpret_cast<uintptr_t>(input) % alignof(float2) == 0
+                && reinterpret_cast<uintptr_t>(output) % alignof(float4) == 0;
+            if (vector_safe) {
+                comfy::dequantize_fp8_tensor_kernel<InputType, OutputType>
+                    <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
+                        static_cast<const InputType*>(input), static_cast<OutputType*>(output), scale_f, numel);
+            } else {
+                const int scalar_blocks = static_cast<int>((numel + comfy::kQMaxKernelThreads - 1) / comfy::kQMaxKernelThreads);
+                comfy::dequantize_fp8_tensor_scalar_kernel<InputType, OutputType>
+                    <<<scalar_blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
+                        static_cast<const InputType*>(input), static_cast<OutputType*>(output), scale_f, numel);
+            }
         });
 
     // Check for kernel launch errors
