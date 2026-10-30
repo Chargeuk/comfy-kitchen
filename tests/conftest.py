@@ -127,6 +127,13 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
             constraints = ck.registry.get_constraints(backend_name, func_name)
             if constraints is not None and device not in constraints.default_devices:
                 continue
+            # Device="cuda" alone does not make architecture-specific PTX
+            # available. Match production dispatch instead of forcing SM100
+            # conversions on Ada through the test's backend override.
+            if (device == "cuda" and constraints is not None
+                    and constraints.min_compute_capability is not None
+                    and torch.cuda.get_device_capability() < constraints.min_compute_capability):
+                continue
 
         capable.append(backend_name)
 
